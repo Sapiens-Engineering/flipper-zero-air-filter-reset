@@ -464,13 +464,13 @@ impl App {
     fn handle_state(&mut self, result: DialogResult) -> StateAction {
         match self.state {
             AppState::StartPrompt => match result {
-                DialogResult::Left => {
+                DialogResult::Left => StateAction::Exit(0),
+                DialogResult::Right => {
                     self.state = AppState::Scanning;
                     self.show_scanning();
-                    self.do_scan();
+                    // self.do_scan();
                     StateAction::Continue
                 }
-                DialogResult::Right => StateAction::Exit(0),
                 _ => StateAction::Continue,
             },
             AppState::Scanning => StateAction::Exit(0), // Back pressed
@@ -478,7 +478,7 @@ impl App {
                 DialogResult::Right => {
                     self.state = AppState::Writing;
                     self.show_writing();
-                    self.do_write();
+                    // self.do_write();
                     StateAction::Continue
                 }
                 DialogResult::Left => StateAction::Exit(0),
@@ -559,7 +559,7 @@ impl App {
     fn show_start_prompt(&self) {
         self.setup_dialog(
             STR_TITLE, STR_START_SCAN.to_bytes_with_nul(), DIALOG_TEXT_Y,
-            Some(STR_YES), None, Some(STR_ABORT),
+            Some(STR_ABORT), None, Some(STR_YES),
         );
     }
 

@@ -1,0 +1,23 @@
+cargo-features = ["different-binary-name"]
+
+[package]
+name = "flipper-xiaomi-filter-reset"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "flipper-xiaomi-filter-reset"
+filename = "flipper-xiaomi-filter-reset.fap"
+bench = false
+test = false
+
+[dependencies]
+flipperzero = { version = "0.16.0" }
+flipperzero-sys = { version = "0.16.0" }
+flipperzero-rt = { version = "0.16.0" }
+sha1 = { version = "0.10", default-features = false }

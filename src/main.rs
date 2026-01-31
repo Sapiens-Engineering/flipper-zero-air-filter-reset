@@ -472,9 +472,9 @@ impl App {
     fn build_info_text(&mut self) -> &CStr {
         let mut pos = 0;
 
-        // "UID:"
-        self.info_text[pos..pos + 4].copy_from_slice(b"UID:");
-        pos += 4;
+        // "UID: " (with trailing space)
+        self.info_text[pos..pos + 5].copy_from_slice(b"UID: ");
+        pos += 5;
 
         // UID with colons
         pos += format_hex_bytes(
@@ -483,9 +483,9 @@ impl App {
             Some(b':'),
         );
 
-        // "\nPWD:"
-        self.info_text[pos..pos + 5].copy_from_slice(b"\nPWD:");
-        pos += 5;
+        // "\nPWD: " (with trailing space)
+        self.info_text[pos..pos + 6].copy_from_slice(b"\nPWD: ");
+        pos += 6;
 
         // Password without separator
         pos += format_hex_bytes(&self.tag_data.password, &mut self.info_text[pos..], None);
@@ -493,8 +493,9 @@ impl App {
         // Null terminate
         self.info_text[pos] = 0;
 
-        // SAFETY: We just null-terminated the string at position pos
-        unsafe { CStr::from_bytes_with_nul_unchecked(&self.info_text[..=pos]) }
+        // Create CStr with bounds checking
+        CStr::from_bytes_with_nul(&self.info_text[..=pos])
+            .expect("Info text contains invalid null byte")
     }
 
     // -------------------------------------------------------------------------

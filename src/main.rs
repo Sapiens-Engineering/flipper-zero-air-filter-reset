@@ -69,6 +69,7 @@ const STR_SCAN_TIMEOUT: &CStr = c"Scan timeout";
 const STR_AUTH_FAILED: &CStr = c"Auth failed";
 const STR_WRITE_FAILED: &CStr = c"Write failed";
 const STR_NFC_ERROR: &CStr = c"NFC error";
+const STR_SCANNING: &CStr = c"Scanning...";
 
 // =============================================================================
 // Types
@@ -78,7 +79,8 @@ const STR_NFC_ERROR: &CStr = c"NFC error";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppState {
     StartPrompt,
-    Scanning,
+    ScanDialog,
+    ScanRunning,
     TagInfo,
     Writing,
     Success,
@@ -321,6 +323,9 @@ struct App {
     error_msg: &'static CStr,
     nfc: *mut sys::Nfc,
     info_text: [u8; 128],
+    scan_ctx: Option<ScanContext>,
+    scan_poller: Option<*mut sys::NfcPoller>,
+    scan_elapsed_ms: u32,
 }
 
 impl App {
@@ -343,13 +348,22 @@ impl App {
                 error_msg: STR_NFC_ERROR,
                 nfc,
                 info_text: [0u8; 128],
+                scan_ctx: None,
+                scan_poller: None,
+                scan_elapsed_ms: 0,
             })
         }
     }
 
     /// Clean up all allocated resources
     fn cleanup(&mut self) {
-        // SAFETY: Freeing NFC resource
+        if let Some(poller) = self.scan_poller.take() {
+            unsafe {
+                sys::nfc_poller_stop(poller);
+                sys::nfc_poller_free(poller);
+            }
+        }
+
         unsafe {
             sys::nfc_free(self.nfc);
         }
@@ -365,17 +379,33 @@ impl App {
             match self.state {
                 AppState::StartPrompt => match self.show_start_prompt() {
                     DialogMessageButton::Right => {
-                        self.state = AppState::Scanning;
-                        self.do_scan();
+                        // Only change state, don't scan yet
+                        self.state = AppState::ScanDialog;
                     }
                     DialogMessageButton::Left | DialogMessageButton::Back => {
                         return 0;
                     }
                     _ => {}
                 },
-                AppState::Scanning => {
-                    // Scanning is handled in do_scan(), which transitions to TagInfo or Failure
-                    return 0;
+                AppState::ScanDialog => {
+                    // Show dialog and start async scan
+                    self.show_scanning_dialog();
+                    self.start_async_scan();
+                    self.state = AppState::ScanRunning;
+                }
+                AppState::ScanRunning => {
+                    // Poll scan progress, check if complete
+                    unsafe { sys::furi_delay_ms(POLL_INTERVAL_MS) };
+                    self.scan_elapsed_ms += POLL_INTERVAL_MS;
+
+                    if self.scan_elapsed_ms >= SCAN_TIMEOUT_MS {
+                        self.stop_scan();
+                        self.fail_with(STR_SCAN_TIMEOUT);
+                    } else {
+                        if self.is_scan_complete() {
+                            self.finalize_scan();
+                        }
+                    }
                 }
                 AppState::TagInfo => match self.show_tag_info() {
                     DialogMessageButton::Right => {
@@ -405,9 +435,10 @@ impl App {
                             return 0;
                         }
                         DialogMessageButton::Right => {
-                            // Retry - go back to scanning
-                            self.state = AppState::Scanning;
+                            // Retry - go back to scanning dialog
+                            self.state = AppState::ScanDialog;
                         }
+                        _ => {}
                     }
                 }
             }
@@ -428,6 +459,18 @@ impl App {
         message.set_buttons(Some(STR_ABORT), None, Some(STR_YES));
 
         dialogs.show_message(&message)
+    }
+
+    /// Show scanning dialog (non-blocking, just displays text)
+    fn show_scanning_dialog(&self) {
+        let mut dialogs = DialogsApp::open();
+        let mut message = DialogMessage::new();
+
+        message.set_header(STR_TITLE, 5, 8, Align::Left, Align::Top);
+        message.set_text(STR_SCANNING, 5, 25, Align::Left, Align::Top);
+        message.set_buttons(None, None, None);
+
+        dialogs.show_message(&message);
     }
 
     /// Show tag info dialog and return button pressed
@@ -502,59 +545,75 @@ impl App {
     // NFC Operations
     // -------------------------------------------------------------------------
 
-    /// Perform NFC scan to get UID
-    fn do_scan(&mut self) {
+    /// Start asynchronous NFC scan
+    fn start_async_scan(&mut self) {
         println!("Starting NFC scan...");
 
-        /*
-        let mut ctx = ScanContext::new();
+        self.scan_ctx = Some(ScanContext::new());
 
-        // SAFETY: NFC poller allocation, start, polling, stop, and free
-        let scan_result = unsafe {
-            let poller = sys::nfc_poller_alloc(self.nfc, sys::NfcProtocolIso14443_3a);
-            if poller.is_null() {
-                return self.fail_with(STR_NFC_ERROR);
+        let poller = unsafe {
+            let p = sys::nfc_poller_alloc(self.nfc, sys::NfcProtocolIso14443_3a);
+            if p.is_null() {
+                self.scan_ctx = None;
+                self.fail_with(STR_NFC_ERROR);
+                return;
             }
+
+            let ctx_ptr = match &mut self.scan_ctx {
+                Some(ctx) => ctx as *mut ScanContext,
+                None => return,
+            };
 
             sys::nfc_poller_start(
-                poller, Some(iso14443_3a_scan_callback),
-                &mut ctx as *mut ScanContext as *mut core::ffi::c_void,
+                p,
+                Some(iso14443_3a_scan_callback),
+                ctx_ptr as *mut core::ffi::c_void,
             );
-
-            // Poll until complete or timeout
-            let mut elapsed = 0u32;
-            while elapsed < SCAN_TIMEOUT_MS && !ctx.got_uid && !ctx.error {
-                sys::furi_delay_ms(POLL_INTERVAL_MS);
-                elapsed += POLL_INTERVAL_MS;
-            }
-
-            sys::nfc_poller_stop(poller);
-            sys::nfc_poller_free(poller);
-
-            if ctx.error { Err(STR_NFC_ERROR) }
-            else if !ctx.got_uid { Err(STR_SCAN_TIMEOUT) }
-            else { Ok(()) }
+            p
         };
 
-        if let Err(msg) = scan_result {
-            return self.fail_with(msg);
+        self.scan_poller = Some(poller);
+        self.scan_elapsed_ms = 0;
+    }
+
+    /// Check if scan is complete (success or error)
+    fn is_scan_complete(&self) -> bool {
+        match &self.scan_ctx {
+            Some(ctx) => ctx.got_uid || ctx.error || false,
+            None => false,
         }
+    }
 
-        // Store UID and derive password
-        self.tag_data.uid = ctx.uid;
-        self.tag_data.uid_len = ctx.uid_len;
-        if ctx.uid_len == 7 {
-            self.tag_data.password = derive_password(&self.tag_data.uid);
+    /// Finalize scan operation and handle results
+    fn finalize_scan(&mut self) {
+        self.stop_scan();
+
+        if let Some(ctx) = self.scan_ctx.take() {
+            if ctx.error {
+                self.fail_with(STR_NFC_ERROR);
+            } else if !ctx.got_uid {
+                self.fail_with(STR_SCAN_TIMEOUT);
+            } else {
+                self.tag_data.uid = ctx.uid;
+                self.tag_data.uid_len = ctx.uid_len;
+                if ctx.uid_len == 7 {
+                    self.tag_data.password = derive_password(&self.tag_data.uid);
+                }
+
+                println!("Tag found, UID len: {}", self.tag_data.uid_len);
+                self.state = AppState::TagInfo;
+            }
         }
-        */
+    }
 
-        // Mock data for UI testing
-        self.tag_data.uid = [0x04, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6];
-        self.tag_data.uid_len = 7;
-        self.tag_data.password = derive_password(&self.tag_data.uid);
-
-        println!("Tag found, UID len: {}", self.tag_data.uid_len);
-        self.state = AppState::TagInfo;
+    /// Stop the current scan and clean up resources
+    fn stop_scan(&mut self) {
+        if let Some(poller) = self.scan_poller.take() {
+            unsafe {
+                sys::nfc_poller_stop(poller);
+                sys::nfc_poller_free(poller);
+            }
+        }
     }
 
     /// Perform write operation (auth + write zeros to filter block)
@@ -609,7 +668,6 @@ impl App {
     fn fail_with(&mut self, msg: &'static CStr) {
         self.error_msg = msg;
         self.state = AppState::Failure;
-        self.show_failure();
     }
 }
 

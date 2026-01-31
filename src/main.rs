@@ -16,9 +16,12 @@ extern crate flipperzero_rt;
 mod password;
 
 use core::ffi::CStr;
-use core::ptr;
 
-use flipperzero::println;
+use flipperzero::{
+    dialogs::{DialogMessage, DialogMessageButton, DialogsApp},
+    gui::canvas::Align,
+    println,
+};
 use flipperzero_rt::{entry, manifest};
 use flipperzero_sys as sys;
 
@@ -45,44 +48,27 @@ entry!(main);
 /// Block 8 is the filter status page on Xiaomi filter NTAG tags
 const NTAG_BLOCK_FILTER_STATUS: u8 = 0x08;
 
-// Screen layout (Flipper Zero has 128x64 display)
-const SCREEN_CENTER_X: u8 = 64;
-const HEADER_Y: u8 = 0;
-const DIALOG_TEXT_Y: u8 = 32;
-const POPUP_HEADER_Y: u8 = 20;
-const POPUP_TEXT_Y: u8 = 40;
-const TAG_INFO_TEXT_Y: u8 = 28;
-
 // Timeouts
 const SCAN_TIMEOUT_MS: u32 = 30_000;
 const WRITE_TIMEOUT_MS: u32 = 10_000;
 const POLL_INTERVAL_MS: u32 = 100;
-const SUCCESS_DISPLAY_MS: u32 = 3000;
-
-// View IDs
-const VIEW_DIALOG: u32 = 0;
-const VIEW_POPUP: u32 = 1;
 
 // UI Strings
 const STR_TITLE: &CStr = c"Xiaomi Filter Reset";
 const STR_START_SCAN: &CStr = c"Start scan?";
 const STR_YES: &CStr = c"Yes";
 const STR_ABORT: &CStr = c"Abort";
-const STR_SCANNING: &CStr = c"Scanning...";
-const STR_PLACE_TAG: &CStr = c"Place filter tag near Flipper";
 const STR_TAG_FOUND: &CStr = c"Tag Found";
 const STR_WRITE: &CStr = c"Write";
-const STR_WRITING: &CStr = c"Writing...";
-const STR_KEEP_TAG: &CStr = c"Keep tag in place";
 const STR_SUCCESS: &CStr = c"Success!";
 const STR_RESET_100: &CStr = c"Filter reset to 100%";
 const STR_FAILURE: &CStr = c"Failure";
 const STR_OK: &CStr = c"OK";
+const STR_RETRY: &CStr = c"Retry";
 const STR_SCAN_TIMEOUT: &CStr = c"Scan timeout";
 const STR_AUTH_FAILED: &CStr = c"Auth failed";
 const STR_WRITE_FAILED: &CStr = c"Write failed";
 const STR_NFC_ERROR: &CStr = c"NFC error";
-const STR_GUI: &CStr = c"gui";
 
 // =============================================================================
 // Types
@@ -97,21 +83,6 @@ enum AppState {
     Writing,
     Success,
     Failure,
-}
-
-/// Dialog button result from callback
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DialogResult {
-    None,
-    Left,
-    Center,
-    Right,
-}
-
-/// Result of state handling
-enum StateAction {
-    Continue,
-    Exit(i32),
 }
 
 /// Tag information collected during scan
@@ -170,17 +141,11 @@ impl WriteContext {
 }
 
 // =============================================================================
-// Global State (required for C callbacks)
-// =============================================================================
-
-static mut DIALOG_RESULT: DialogResult = DialogResult::None;
-
-// =============================================================================
 // Utility Functions
 // =============================================================================
 
 /// Format bytes as hex string into buffer.
-/// 
+///
 /// - `separator`: If `Some(b':')`, produces "AA:BB:CC". If `None`, produces "AABBCC".
 /// - Returns number of bytes written.
 fn format_hex_bytes(bytes: &[u8], buf: &mut [u8], separator: Option<u8>) -> usize {
@@ -209,24 +174,6 @@ fn format_hex_bytes(bytes: &[u8], buf: &mut [u8], separator: Option<u8>) -> usiz
 // NFC Callbacks
 // =============================================================================
 
-/// Dialog result callback (sets global state)
-unsafe extern "C" fn dialog_callback(
-    result: sys::DialogExResult,
-    _context: *mut core::ffi::c_void,
-) {
-    unsafe {
-        DIALOG_RESULT = match result {
-            sys::DialogExResultLeft => DialogResult::Left,
-            sys::DialogExResultCenter => DialogResult::Center,
-            sys::DialogExResultRight => DialogResult::Right,
-            _ => DialogResult::None,
-        };
-    }
-}
-
-/// Popup timeout callback (no-op, timeout handled in main loop)
-unsafe extern "C" fn popup_callback(_context: *mut core::ffi::c_void) {}
-
 /// ISO14443-3A poller callback for scanning (getting UID)
 unsafe extern "C" fn iso14443_3a_scan_callback(
     event: sys::NfcGenericEvent,
@@ -242,7 +189,7 @@ unsafe extern "C" fn iso14443_3a_scan_callback(
     match iso_event.type_ {
         sys::Iso14443_3aPollerEventTypeReady => {
             let instance = event.instance as *mut sys::Iso14443_3aPoller;
-            
+
             // Allocate and activate to get UID
             let iso_data = unsafe { sys::iso14443_3a_alloc() };
             if iso_data.is_null() {
@@ -251,7 +198,7 @@ unsafe extern "C" fn iso14443_3a_scan_callback(
             }
 
             let result = unsafe { sys::iso14443_3a_poller_activate(instance, iso_data) };
-            
+
             if result == sys::Iso14443_3aErrorNone {
                 let data = unsafe { &*iso_data };
                 let uid_len = (data.uid_len as usize).min(7);
@@ -294,14 +241,24 @@ unsafe extern "C" fn iso14443_3a_write_callback(
             let rx_buffer = unsafe { sys::bit_buffer_alloc(16) };
 
             if tx_buffer.is_null() || rx_buffer.is_null() {
-                if !tx_buffer.is_null() { unsafe { sys::bit_buffer_free(tx_buffer) }; }
-                if !rx_buffer.is_null() { unsafe { sys::bit_buffer_free(rx_buffer) }; }
+                if !tx_buffer.is_null() {
+                    unsafe { sys::bit_buffer_free(tx_buffer) };
+                }
+                if !rx_buffer.is_null() {
+                    unsafe { sys::bit_buffer_free(rx_buffer) };
+                }
                 ctx.error = true;
                 return sys::NfcCommandStop;
             }
 
             // PWD_AUTH command: 0x1B + 4-byte password
-            let auth_cmd = [0x1B, ctx.password[0], ctx.password[1], ctx.password[2], ctx.password[3]];
+            let auth_cmd = [
+                0x1B,
+                ctx.password[0],
+                ctx.password[1],
+                ctx.password[2],
+                ctx.password[3],
+            ];
             unsafe {
                 sys::bit_buffer_reset(tx_buffer);
                 sys::bit_buffer_copy_bytes(tx_buffer, auth_cmd.as_ptr(), auth_cmd.len());
@@ -312,7 +269,10 @@ unsafe extern "C" fn iso14443_3a_write_callback(
             };
 
             if auth_result != sys::Iso14443_3aErrorNone {
-                unsafe { sys::bit_buffer_free(tx_buffer); sys::bit_buffer_free(rx_buffer); }
+                unsafe {
+                    sys::bit_buffer_free(tx_buffer);
+                    sys::bit_buffer_free(rx_buffer);
+                }
                 ctx.error = true;
                 return sys::NfcCommandStop;
             }
@@ -329,7 +289,10 @@ unsafe extern "C" fn iso14443_3a_write_callback(
                 sys::iso14443_3a_poller_send_standard_frame(instance, tx_buffer, rx_buffer, 5000)
             };
 
-            unsafe { sys::bit_buffer_free(tx_buffer); sys::bit_buffer_free(rx_buffer); }
+            unsafe {
+                sys::bit_buffer_free(tx_buffer);
+                sys::bit_buffer_free(rx_buffer);
+            }
 
             if write_result != sys::Iso14443_3aErrorNone {
                 ctx.error = true;
@@ -356,9 +319,6 @@ struct App {
     state: AppState,
     tag_data: TagData,
     error_msg: &'static CStr,
-    view_dispatcher: *mut sys::ViewDispatcher,
-    dialog: *mut sys::DialogEx,
-    popup: *mut sys::Popup,
     nfc: *mut sys::Nfc,
     info_text: [u8; 128],
 }
@@ -370,50 +330,17 @@ impl App {
 
     /// Create a new application instance. Returns None if allocation fails.
     fn new() -> Option<Self> {
-        // SAFETY: All FFI calls for GUI and NFC resource allocation
+        // SAFETY: NFC resource allocation
         unsafe {
-            let gui = sys::furi_record_open(STR_GUI.as_ptr() as *const u8) as *mut sys::Gui;
-            if gui.is_null() { return None; }
-
-            let view_dispatcher = sys::view_dispatcher_alloc();
-            if view_dispatcher.is_null() {
-                sys::furi_record_close(STR_GUI.as_ptr() as *const u8);
-                return None;
-            }
-
-            let dialog = sys::dialog_ex_alloc();
-            let popup = sys::popup_alloc();
             let nfc = sys::nfc_alloc();
-
-            // Cleanup on partial failure
-            if dialog.is_null() || popup.is_null() || nfc.is_null() {
-                if !dialog.is_null() { sys::dialog_ex_free(dialog); }
-                if !popup.is_null() { sys::popup_free(popup); }
-                if !nfc.is_null() { sys::nfc_free(nfc); }
-                sys::view_dispatcher_free(view_dispatcher);
-                sys::furi_record_close(STR_GUI.as_ptr() as *const u8);
+            if nfc.is_null() {
                 return None;
             }
-
-            // Configure view dispatcher
-            sys::view_dispatcher_enable_queue(view_dispatcher);
-            sys::view_dispatcher_attach_to_gui(view_dispatcher, gui, sys::ViewDispatcherTypeFullscreen);
-            sys::view_dispatcher_add_view(view_dispatcher, VIEW_DIALOG, sys::dialog_ex_get_view(dialog));
-            sys::view_dispatcher_add_view(view_dispatcher, VIEW_POPUP, sys::popup_get_view(popup));
-
-            // Set up callbacks
-            sys::dialog_ex_set_context(dialog, ptr::null_mut());
-            sys::dialog_ex_set_result_callback(dialog, Some(dialog_callback));
-            sys::popup_set_context(popup, ptr::null_mut());
-            sys::popup_set_callback(popup, Some(popup_callback));
 
             Some(Self {
                 state: AppState::StartPrompt,
                 tag_data: TagData::new(),
                 error_msg: STR_NFC_ERROR,
-                view_dispatcher,
-                dialog,
-                popup,
                 nfc,
                 info_text: [0u8; 128],
             })
@@ -422,15 +349,9 @@ impl App {
 
     /// Clean up all allocated resources
     fn cleanup(&mut self) {
-        // SAFETY: Freeing all allocated FFI resources
+        // SAFETY: Freeing NFC resource
         unsafe {
-            sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_DIALOG);
-            sys::view_dispatcher_remove_view(self.view_dispatcher, VIEW_POPUP);
             sys::nfc_free(self.nfc);
-            sys::dialog_ex_free(self.dialog);
-            sys::popup_free(self.popup);
-            sys::view_dispatcher_free(self.view_dispatcher);
-            sys::furi_record_close(STR_GUI.as_ptr() as *const u8);
         }
     }
 
@@ -440,115 +361,56 @@ impl App {
 
     /// Run the application main loop
     fn run(&mut self) -> i32 {
-        self.show_start_prompt();
-
         loop {
-            let result = self.wait_for_input();
-            match self.handle_state(result) {
-                StateAction::Continue => continue,
-                StateAction::Exit(code) => return code,
-            }
-        }
-    }
-
-    /// Wait for user input via view dispatcher
-    fn wait_for_input(&self) -> DialogResult {
-        unsafe {
-            DIALOG_RESULT = DialogResult::None;
-            sys::view_dispatcher_run(self.view_dispatcher);
-            DIALOG_RESULT
-        }
-    }
-
-    /// Handle current state based on user input, returns next action
-    fn handle_state(&mut self, result: DialogResult) -> StateAction {
-        match self.state {
-            AppState::StartPrompt => match result {
-                DialogResult::Left => StateAction::Exit(0),
-                DialogResult::Right => {
-                    self.state = AppState::Scanning;
-                    self.show_scanning();
-                    // self.do_scan();
-                    StateAction::Continue
+            match self.state {
+                AppState::StartPrompt => match self.show_start_prompt() {
+                    DialogMessageButton::Right => {
+                        self.state = AppState::Scanning;
+                        self.do_scan();
+                    }
+                    DialogMessageButton::Left | DialogMessageButton::Back => {
+                        return 0;
+                    }
+                    _ => {}
+                },
+                AppState::Scanning => {
+                    // Scanning is handled in do_scan(), which transitions to TagInfo or Failure
+                    return 0;
                 }
-                _ => StateAction::Continue,
-            },
-            AppState::Scanning => StateAction::Exit(0), // Back pressed
-            AppState::TagInfo => match result {
-                DialogResult::Right => {
-                    self.state = AppState::Writing;
-                    self.show_writing();
-                    // self.do_write();
-                    StateAction::Continue
+                AppState::TagInfo => match self.show_tag_info() {
+                    DialogMessageButton::Right => {
+                        self.state = AppState::Writing;
+                        self.do_write();
+                    }
+                    DialogMessageButton::Left | DialogMessageButton::Back => {
+                        return 0;
+                    }
+                    _ => {}
+                },
+                AppState::Writing => {
+                    // Writing is handled in do_write(), which transitions to Success or Failure
+                    return 0;
                 }
-                DialogResult::Left => StateAction::Exit(0),
-                _ => StateAction::Continue,
-            },
-            AppState::Writing => StateAction::Continue,
-            AppState::Success => StateAction::Exit(0),
-            AppState::Failure => match result {
-                DialogResult::Center => StateAction::Exit(0),
-                _ => StateAction::Continue,
-            },
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // UI Helpers
-    // -------------------------------------------------------------------------
-
-    /// Configure and show a dialog with header, text, and up to 3 buttons
-    fn setup_dialog(
-        &self,
-        header: &CStr,
-        text: &[u8],
-        text_y: u8,
-        left: Option<&CStr>,
-        center: Option<&CStr>,
-        right: Option<&CStr>,
-    ) {
-        // SAFETY: FFI calls to configure dialog
-        unsafe {
-            sys::dialog_ex_reset(self.dialog);
-            sys::dialog_ex_set_header(
-                self.dialog, header.as_ptr() as *const u8,
-                SCREEN_CENTER_X, HEADER_Y, sys::AlignCenter, sys::AlignTop,
-            );
-            sys::dialog_ex_set_text(
-                self.dialog, text.as_ptr(),
-                SCREEN_CENTER_X, text_y, sys::AlignCenter, sys::AlignCenter,
-            );
-            if let Some(btn) = left {
-                sys::dialog_ex_set_left_button_text(self.dialog, btn.as_ptr() as *const u8);
+                AppState::Success => match self.show_success() {
+                    DialogMessageButton::Center | DialogMessageButton::Back => {
+                        return 0;
+                    }
+                    _ => {}
+                },
+                AppState::Failure => {
+                    match self.show_failure() {
+                        DialogMessageButton::Left
+                        | DialogMessageButton::Center
+                        | DialogMessageButton::Back => {
+                            return 0;
+                        }
+                        DialogMessageButton::Right => {
+                            // Retry - go back to scanning
+                            self.state = AppState::Scanning;
+                        }
+                    }
+                }
             }
-            if let Some(btn) = center {
-                sys::dialog_ex_set_center_button_text(self.dialog, btn.as_ptr() as *const u8);
-            }
-            if let Some(btn) = right {
-                sys::dialog_ex_set_right_button_text(self.dialog, btn.as_ptr() as *const u8);
-            }
-            sys::view_dispatcher_switch_to_view(self.view_dispatcher, VIEW_DIALOG);
-        }
-    }
-
-    /// Configure and show a popup with header and text
-    fn setup_popup(&self, header: &CStr, text: &CStr, timeout_ms: Option<u32>) {
-        // SAFETY: FFI calls to configure popup
-        unsafe {
-            sys::popup_reset(self.popup);
-            sys::popup_set_header(
-                self.popup, header.as_ptr() as *const u8,
-                SCREEN_CENTER_X, POPUP_HEADER_Y, sys::AlignCenter, sys::AlignCenter,
-            );
-            sys::popup_set_text(
-                self.popup, text.as_ptr() as *const u8,
-                SCREEN_CENTER_X, POPUP_TEXT_Y, sys::AlignCenter, sys::AlignCenter,
-            );
-            if let Some(ms) = timeout_ms {
-                sys::popup_set_timeout(self.popup, ms);
-                sys::popup_enable_timeout(self.popup);
-            }
-            sys::view_dispatcher_switch_to_view(self.view_dispatcher, VIEW_POPUP);
         }
     }
 
@@ -556,42 +418,58 @@ impl App {
     // UI Screens
     // -------------------------------------------------------------------------
 
-    fn show_start_prompt(&self) {
-        self.setup_dialog(
-            STR_TITLE, STR_START_SCAN.to_bytes_with_nul(), DIALOG_TEXT_Y,
-            Some(STR_ABORT), None, Some(STR_YES),
-        );
+    /// Show start prompt dialog and return button pressed
+    fn show_start_prompt(&self) -> DialogMessageButton {
+        let mut dialogs = DialogsApp::open();
+        let mut message = DialogMessage::new();
+
+        message.set_header(STR_TITLE, 5, 8, Align::Left, Align::Top);
+        message.set_text(STR_START_SCAN, 5, 25, Align::Left, Align::Top);
+        message.set_buttons(Some(STR_ABORT), None, Some(STR_YES));
+
+        dialogs.show_message(&message)
     }
 
-    fn show_scanning(&self) {
-        self.setup_popup(STR_SCANNING, STR_PLACE_TAG, None);
+    /// Show tag info dialog and return button pressed
+    fn show_tag_info(&mut self) -> DialogMessageButton {
+        let info_text = self.build_info_text();
+        let mut dialogs = DialogsApp::open();
+        let mut message = DialogMessage::new();
+
+        message.set_header(STR_TAG_FOUND, 5, 8, Align::Left, Align::Top);
+        message.set_text(&info_text, 5, 22, Align::Left, Align::Top);
+        message.set_buttons(Some(STR_ABORT), None, Some(STR_WRITE));
+
+        dialogs.show_message(&message)
     }
 
-    fn show_tag_info(&mut self) {
-        self.build_info_text();
-        self.setup_dialog(
-            STR_TAG_FOUND, &self.info_text, TAG_INFO_TEXT_Y,
-            Some(STR_ABORT), None, Some(STR_WRITE),
-        );
+    /// Show success message
+    fn show_success(&self) -> DialogMessageButton {
+        let mut dialogs = DialogsApp::open();
+        let mut message = DialogMessage::new();
+
+        message.set_header(STR_SUCCESS, 5, 8, Align::Left, Align::Top);
+        message.set_text(STR_RESET_100, 5, 25, Align::Left, Align::Top);
+        message.set_buttons(None, Some(STR_OK), None);
+
+        dialogs.show_message(&message)
     }
 
-    fn show_writing(&self) {
-        self.setup_popup(STR_WRITING, STR_KEEP_TAG, None);
-    }
+    /// Show failure dialog and return button pressed
+    fn show_failure(&self) -> DialogMessageButton {
+        let mut dialogs = DialogsApp::open();
+        let mut message = DialogMessage::new();
 
-    fn show_success(&self) {
-        self.setup_popup(STR_SUCCESS, STR_RESET_100, Some(SUCCESS_DISPLAY_MS));
-    }
+        message.set_header(STR_FAILURE, 5, 8, Align::Left, Align::Top);
+        message.set_text(self.error_msg, 5, 25, Align::Left, Align::Top);
+        message.set_buttons(Some(STR_ABORT), Some(STR_OK), Some(STR_RETRY));
 
-    fn show_failure(&self) {
-        self.setup_dialog(
-            STR_FAILURE, self.error_msg.to_bytes_with_nul(), DIALOG_TEXT_Y,
-            None, Some(STR_OK), None,
-        );
+        dialogs.show_message(&message)
     }
 
     /// Build tag info text: "UID:XX:XX:...\nPWD:XXXXXXXX"
-    fn build_info_text(&mut self) {
+    /// Returns a CStr reference to the formatted text
+    fn build_info_text(&mut self) -> &CStr {
         let mut pos = 0;
 
         // "UID:"
@@ -614,6 +492,9 @@ impl App {
 
         // Null terminate
         self.info_text[pos] = 0;
+
+        // SAFETY: We just null-terminated the string at position pos
+        unsafe { CStr::from_bytes_with_nul_unchecked(&self.info_text[..=pos]) }
     }
 
     // -------------------------------------------------------------------------
@@ -624,6 +505,7 @@ impl App {
     fn do_scan(&mut self) {
         println!("Starting NFC scan...");
 
+        /*
         let mut ctx = ScanContext::new();
 
         // SAFETY: NFC poller allocation, start, polling, stop, and free
@@ -663,16 +545,22 @@ impl App {
         if ctx.uid_len == 7 {
             self.tag_data.password = derive_password(&self.tag_data.uid);
         }
+        */
+
+        // Mock data for UI testing
+        self.tag_data.uid = [0x04, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6];
+        self.tag_data.uid_len = 7;
+        self.tag_data.password = derive_password(&self.tag_data.uid);
 
         println!("Tag found, UID len: {}", self.tag_data.uid_len);
         self.state = AppState::TagInfo;
-        self.show_tag_info();
     }
 
     /// Perform write operation (auth + write zeros to filter block)
     fn do_write(&mut self) {
         println!("Starting write operation...");
 
+        /*
         let mut ctx = WriteContext::new(self.tag_data.password);
 
         // SAFETY: NFC poller allocation, start, polling, stop, and free
@@ -709,10 +597,11 @@ impl App {
         if let Err(msg) = write_result {
             return self.fail_with(msg);
         }
+        */
 
+        // Mock success for UI testing
         println!("Write successful!");
         self.state = AppState::Success;
-        self.show_success();
     }
 
     /// Transition to failure state with given message

@@ -62,14 +62,14 @@ const STR_YES: &CStr = c"Yes";
 const STR_ABORT: &CStr = c"Abort";
 const STR_TAG_FOUND: &CStr = c"Tag Found";
 const STR_WRITE: &CStr = c"Write";
-const STR_SUCCESS: &CStr = c"Success!";
-const STR_RESET_100: &CStr = c"Filter reset to 100%";
+const STR_SUCCESS: &CStr = c"Block 8 Written";
 const STR_FAILURE: &CStr = c"Failure";
 const STR_OK: &CStr = c"OK";
 const STR_RETRY: &CStr = c"Retry";
 const STR_SCAN_TIMEOUT: &CStr = c"Scan timeout";
 const STR_AUTH_FAILED: &CStr = c"Auth failed";
 const STR_WRITE_FAILED: &CStr = c"Write failed";
+const STR_READ_FAILED: &CStr = c"Read failed";
 const STR_NFC_ERROR: &CStr = c"NFC error";
 const STR_SCANNING: &CStr = c"Scanning...";
 const STR_DEBUG_WRITE: &CStr = c"Write Debug";
@@ -108,6 +108,9 @@ struct TagData {
     uid: [u8; 7],
     uid_len: usize,
     password: [u8; 4],
+    block_before: [u8; 4],
+    block_after: [u8; 4],
+    read_after_ok: bool,
 }
 
 impl TagData {
@@ -116,6 +119,9 @@ impl TagData {
             uid: [0u8; 7],
             uid_len: 0,
             password: [0u8; 4],
+            block_before: [0u8; 4],
+            block_after: [0u8; 4],
+            read_after_ok: false,
         }
     }
 }
@@ -143,8 +149,12 @@ impl ScanContext {
 struct WriteContext {
     password: [u8; 4],
     auth_done: bool,
+    read_before_done: bool,
     write_done: bool,
+    read_after_done: bool,
     error: bool,
+    block_before: [u8; 4],
+    block_after: [u8; 4],
 }
 
 impl WriteContext {
@@ -152,8 +162,12 @@ impl WriteContext {
         Self {
             password,
             auth_done: false,
+            read_before_done: false,
             write_done: false,
+            read_after_done: false,
             error: false,
+            block_before: [0u8; 4],
+            block_after: [0u8; 4],
         }
     }
 }
@@ -251,7 +265,15 @@ unsafe extern "C" fn iso14443_3a_scan_callback(
     }
 }
 
-/// ISO14443-3A poller callback for write operations (auth + write)
+/// ISO14443-3A poller callback for write operations
+///
+/// Sequence: AUTH → READ (before) → WRITE → READ (after, optional)
+///
+/// Error handling:
+/// - Auth failure: ctx.error = true, ctx.auth_done = false
+/// - Read-before failure: ctx.error = true, ctx.read_before_done = false
+/// - Write failure: ctx.error = true, ctx.write_done = false
+/// - Read-after failure: NOT an error, just ctx.read_after_done = false
 unsafe extern "C" fn iso14443_3a_write_callback(
     event: sys::NfcGenericEvent,
     context: *mut core::ffi::c_void,
@@ -267,9 +289,9 @@ unsafe extern "C" fn iso14443_3a_write_callback(
         sys::Iso14443_3aPollerEventTypeReady => {
             let instance = event.instance as *mut sys::Iso14443_3aPoller;
 
-            // Allocate TX/RX buffers
+            // Allocate TX/RX buffers (32 bytes for RX since READ returns 16 bytes)
             let tx_buffer = unsafe { sys::bit_buffer_alloc(16) };
-            let rx_buffer = unsafe { sys::bit_buffer_alloc(16) };
+            let rx_buffer = unsafe { sys::bit_buffer_alloc(32) };
 
             if tx_buffer.is_null() || rx_buffer.is_null() {
                 if !tx_buffer.is_null() {
@@ -282,7 +304,9 @@ unsafe extern "C" fn iso14443_3a_write_callback(
                 return sys::NfcCommandStop;
             }
 
-            // PWD_AUTH command: 0x1B + 4-byte password
+            // =====================================================================
+            // Step 1: PWD_AUTH command (0x1B + 4-byte password)
+            // =====================================================================
             let auth_cmd = [
                 0x1B,
                 ctx.password[0],
@@ -309,7 +333,45 @@ unsafe extern "C" fn iso14443_3a_write_callback(
             }
             ctx.auth_done = true;
 
-            // WRITE command: 0xA2 + page + 4 zero bytes
+            // =====================================================================
+            // Step 2: READ block 8 before write (0x30 + block address)
+            // Returns 16 bytes (4 pages), we only need first 4 bytes
+            // =====================================================================
+            let read_cmd = [0x30, NTAG_BLOCK_FILTER_STATUS];
+            unsafe {
+                sys::bit_buffer_reset(tx_buffer);
+                sys::bit_buffer_copy_bytes(tx_buffer, read_cmd.as_ptr(), read_cmd.len());
+            }
+
+            let read_before_result = unsafe {
+                sys::iso14443_3a_poller_send_standard_frame(instance, tx_buffer, rx_buffer, 5000)
+            };
+
+            if read_before_result != sys::Iso14443_3aErrorNone {
+                unsafe {
+                    sys::bit_buffer_free(tx_buffer);
+                    sys::bit_buffer_free(rx_buffer);
+                }
+                ctx.error = true;
+                return sys::NfcCommandStop;
+            }
+
+            // Extract first 4 bytes from response into block_before
+            // Use bit_buffer_get_byte to safely extract individual bytes
+            let rx_size = unsafe { sys::bit_buffer_get_size_bytes(rx_buffer) };
+            if rx_size >= 4 {
+                unsafe {
+                    ctx.block_before[0] = sys::bit_buffer_get_byte(rx_buffer, 0);
+                    ctx.block_before[1] = sys::bit_buffer_get_byte(rx_buffer, 1);
+                    ctx.block_before[2] = sys::bit_buffer_get_byte(rx_buffer, 2);
+                    ctx.block_before[3] = sys::bit_buffer_get_byte(rx_buffer, 3);
+                }
+            }
+            ctx.read_before_done = true;
+
+            // =====================================================================
+            // Step 3: WRITE block 8 with zeros (0xA2 + block + 4 zero bytes)
+            // =====================================================================
             let write_cmd = [0xA2, NTAG_BLOCK_FILTER_STATUS, 0x00, 0x00, 0x00, 0x00];
             unsafe {
                 sys::bit_buffer_reset(tx_buffer);
@@ -320,17 +382,71 @@ unsafe extern "C" fn iso14443_3a_write_callback(
                 sys::iso14443_3a_poller_send_standard_frame(instance, tx_buffer, rx_buffer, 5000)
             };
 
+            // NTAG WRITE command returns a 4-bit ACK, not a standard frame.
+            // send_standard_frame expects a full frame with CRC, so it may timeout.
+            // Timeout (error 7) is acceptable - the write likely succeeded.
+            // We'll verify with read-after.
+            if write_result != sys::Iso14443_3aErrorNone
+                && write_result != sys::Iso14443_3aErrorTimeout
+            {
+                unsafe {
+                    sys::bit_buffer_free(tx_buffer);
+                    sys::bit_buffer_free(rx_buffer);
+                }
+                ctx.error = true;
+                return sys::NfcCommandStop;
+            }
+            ctx.write_done = true;
+
+            // =====================================================================
+            // Step 4: READ block 8 after write (verification, non-fatal on failure)
+            // =====================================================================
+            // The write command may leave communication in a bad state.
+            // Reset buffers and try multiple times with delays.
+            let read_cmd = [0x30, NTAG_BLOCK_FILTER_STATUS];
+
+            // Try read-after up to 3 times (first attempt often fails with CRC error
+            // after WRITE command due to ACK handling)
+            let mut read_after_result = sys::Iso14443_3aErrorTimeout;
+            for _attempt in 0..3 {
+                unsafe {
+                    sys::bit_buffer_reset(tx_buffer);
+                    sys::bit_buffer_reset(rx_buffer);
+                    sys::bit_buffer_copy_bytes(tx_buffer, read_cmd.as_ptr(), read_cmd.len());
+                }
+
+                read_after_result = unsafe {
+                    sys::iso14443_3a_poller_send_standard_frame(
+                        instance, tx_buffer, rx_buffer, 5000,
+                    )
+                };
+
+                if read_after_result == sys::Iso14443_3aErrorNone {
+                    break;
+                }
+            }
+
+            // Read-after is optional - don't set error on failure
+            if read_after_result == sys::Iso14443_3aErrorNone {
+                let rx_size = unsafe { sys::bit_buffer_get_size_bytes(rx_buffer) };
+                if rx_size >= 4 {
+                    unsafe {
+                        ctx.block_after[0] = sys::bit_buffer_get_byte(rx_buffer, 0);
+                        ctx.block_after[1] = sys::bit_buffer_get_byte(rx_buffer, 1);
+                        ctx.block_after[2] = sys::bit_buffer_get_byte(rx_buffer, 2);
+                        ctx.block_after[3] = sys::bit_buffer_get_byte(rx_buffer, 3);
+                    }
+                }
+                ctx.read_after_done = true;
+            }
+            // If read_after fails, read_after_done stays false but we don't set error
+
+            // Clean up buffers
             unsafe {
                 sys::bit_buffer_free(tx_buffer);
                 sys::bit_buffer_free(rx_buffer);
             }
 
-            if write_result != sys::Iso14443_3aErrorNone {
-                ctx.error = true;
-                return sys::NfcCommandStop;
-            }
-
-            ctx.write_done = true;
             sys::NfcCommandStop
         }
         sys::Iso14443_3aPollerEventTypeError => {
@@ -641,13 +757,14 @@ impl App {
         dialogs.show_message(&message)
     }
 
-    /// Show success message
-    fn show_success(&self) -> DialogMessageButton {
+    /// Show success message with before/after block data
+    fn show_success(&mut self) -> DialogMessageButton {
+        let success_text = self.build_success_text();
         let mut dialogs = DialogsApp::open();
         let mut message = DialogMessage::new();
 
         message.set_header(STR_SUCCESS, 5, 8, Align::Left, Align::Top);
-        message.set_text(STR_RESET_100, 5, 25, Align::Left, Align::Top);
+        message.set_text(&success_text, 5, 22, Align::Left, Align::Top);
         message.set_buttons(None, Some(STR_OK), None);
 
         dialogs.show_message(&message)
@@ -725,6 +842,49 @@ impl App {
         // Create CStr with bounds checking
         CStr::from_bytes_with_nul(&self.info_text[..=pos])
             .expect("Debug text contains invalid null byte")
+    }
+
+    /// Build success text showing before/after block 8 data
+    /// Format:
+    ///   Before: XX:XX:XX:XX
+    ///   After:  XX:XX:XX:XX  (or "After:  (unverified)")
+    fn build_success_text(&mut self) -> &CStr {
+        let mut pos = 0;
+
+        // "Before: "
+        self.info_text[pos..pos + 8].copy_from_slice(b"Before: ");
+        pos += 8;
+
+        // Block before data with colons
+        pos += format_hex_bytes(
+            &self.tag_data.block_before,
+            &mut self.info_text[pos..],
+            Some(b':'),
+        );
+
+        // "\nAfter:  "
+        self.info_text[pos..pos + 9].copy_from_slice(b"\nAfter:  ");
+        pos += 9;
+
+        // Block after data with colons, or "(unverified)" if read failed
+        if self.tag_data.read_after_ok {
+            pos += format_hex_bytes(
+                &self.tag_data.block_after,
+                &mut self.info_text[pos..],
+                Some(b':'),
+            );
+        } else {
+            let unverified = b"(unverified)";
+            self.info_text[pos..pos + unverified.len()].copy_from_slice(unverified);
+            pos += unverified.len();
+        }
+
+        // Null terminate
+        self.info_text[pos] = 0;
+
+        // Create CStr with bounds checking
+        CStr::from_bytes_with_nul(&self.info_text[..=pos])
+            .expect("Success text contains invalid null byte")
     }
 
     /// Show write debug dialog displaying exact bytes to be sent
@@ -821,11 +981,10 @@ impl App {
         }
     }
 
-    /// Perform write operation (auth + write zeros to filter block)
+    /// Perform write operation (auth + read before + write + read after)
     fn do_write(&mut self) {
         println!("Starting write operation...");
 
-        /*
         let mut ctx = WriteContext::new(self.tag_data.password);
 
         // SAFETY: NFC poller allocation, start, polling, stop, and free
@@ -836,7 +995,8 @@ impl App {
             }
 
             sys::nfc_poller_start(
-                poller, Some(iso14443_3a_write_callback),
+                poller,
+                Some(iso14443_3a_write_callback),
                 &mut ctx as *mut WriteContext as *mut core::ffi::c_void,
             );
 
@@ -850,8 +1010,15 @@ impl App {
             sys::nfc_poller_stop(poller);
             sys::nfc_poller_free(poller);
 
+            // Determine error type based on which step failed
             if ctx.error {
-                Err(if ctx.auth_done { STR_WRITE_FAILED } else { STR_AUTH_FAILED })
+                if !ctx.auth_done {
+                    Err(STR_AUTH_FAILED)
+                } else if !ctx.read_before_done {
+                    Err(STR_READ_FAILED)
+                } else {
+                    Err(STR_WRITE_FAILED)
+                }
             } else if !ctx.write_done {
                 Err(STR_WRITE_FAILED)
             } else {
@@ -862,9 +1029,12 @@ impl App {
         if let Err(msg) = write_result {
             return self.fail_with(msg);
         }
-        */
 
-        // Mock success for UI testing
+        // Copy captured data to tag_data for display
+        self.tag_data.block_before = ctx.block_before;
+        self.tag_data.block_after = ctx.block_after;
+        self.tag_data.read_after_ok = ctx.read_after_done;
+
         println!("Write successful!");
         self.state = AppState::Success;
     }

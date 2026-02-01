@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use flipperzero::{
     dialogs::{DialogMessage, DialogMessageButton, DialogsApp},
-    gui::{canvas::Align, Gui},
+    gui::{Gui, canvas::Align},
     println,
 };
 use flipperzero_rt::{entry, manifest};
@@ -72,6 +72,11 @@ const STR_AUTH_FAILED: &CStr = c"Auth failed";
 const STR_WRITE_FAILED: &CStr = c"Write failed";
 const STR_NFC_ERROR: &CStr = c"NFC error";
 const STR_SCANNING: &CStr = c"Scanning...";
+const STR_DEBUG_WRITE: &CStr = c"Write Debug";
+const STR_GO: &CStr = c"Go";
+
+/// Debug toggle: show exact write bytes before writing
+const DEBUG_SHOW_WRITE_BYTES: bool = false;
 
 // Screen dimensions for centering text
 const SCREEN_WIDTH: i32 = 128;
@@ -92,6 +97,7 @@ enum AppState {
     ScanDialog,
     ScanRunning,
     TagInfo,
+    WriteDebug,
     Writing,
     Success,
     Failure,
@@ -499,11 +505,27 @@ impl App {
                 }
                 AppState::TagInfo => match self.show_tag_info() {
                     DialogMessageButton::Right => {
+                        if DEBUG_SHOW_WRITE_BYTES {
+                            self.state = AppState::WriteDebug;
+                        } else {
+                            self.state = AppState::Writing;
+                            self.do_write();
+                        }
+                    }
+                    DialogMessageButton::Left | DialogMessageButton::Back => {
+                        return 0;
+                    }
+                    _ => {}
+                },
+                AppState::WriteDebug => match self.show_write_debug() {
+                    DialogMessageButton::Right => {
+                        // Go - proceed to actual write
                         self.state = AppState::Writing;
                         self.do_write();
                     }
                     DialogMessageButton::Left | DialogMessageButton::Back => {
-                        return 0;
+                        // Abort - return to start (not exit app)
+                        self.state = AppState::StartPrompt;
                     }
                     _ => {}
                 },
@@ -672,6 +694,50 @@ impl App {
         // Create CStr with bounds checking
         CStr::from_bytes_with_nul(&self.info_text[..=pos])
             .expect("Info text contains invalid null byte")
+    }
+
+    /// Build write debug text showing exact bytes to be sent
+    /// Format:
+    ///   AUTH: 1B XX XX XX XX
+    ///   WRITE: A2 08 00 00 00 00
+    fn build_write_debug_text(&mut self) -> &CStr {
+        let mut pos = 0;
+
+        // "AUTH: 1B " - PWD_AUTH command prefix
+        self.info_text[pos..pos + 9].copy_from_slice(b"AUTH: 1B ");
+        pos += 9;
+
+        // Password bytes with spaces
+        pos += format_hex_bytes(
+            &self.tag_data.password,
+            &mut self.info_text[pos..],
+            Some(b' '),
+        );
+
+        // "\nWRITE: A2 08 00 00 00 00" - WRITE command (block 8, zeros)
+        let write_line = b"\nWRITE: A2 08 00 00 00 00";
+        self.info_text[pos..pos + write_line.len()].copy_from_slice(write_line);
+        pos += write_line.len();
+
+        // Null terminate
+        self.info_text[pos] = 0;
+
+        // Create CStr with bounds checking
+        CStr::from_bytes_with_nul(&self.info_text[..=pos])
+            .expect("Debug text contains invalid null byte")
+    }
+
+    /// Show write debug dialog displaying exact bytes to be sent
+    fn show_write_debug(&mut self) -> DialogMessageButton {
+        let debug_text = self.build_write_debug_text();
+        let mut dialogs = DialogsApp::open();
+        let mut message = DialogMessage::new();
+
+        message.set_header(STR_DEBUG_WRITE, 5, 8, Align::Left, Align::Top);
+        message.set_text(&debug_text, 5, 22, Align::Left, Align::Top);
+        message.set_buttons(Some(STR_ABORT), None, Some(STR_GO));
+
+        dialogs.show_message(&message)
     }
 
     // -------------------------------------------------------------------------

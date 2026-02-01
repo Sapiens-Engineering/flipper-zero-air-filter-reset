@@ -16,10 +16,11 @@ extern crate flipperzero_rt;
 mod password;
 
 use core::ffi::CStr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use flipperzero::{
     dialogs::{DialogMessage, DialogMessageButton, DialogsApp},
-    gui::canvas::Align,
+    gui::{canvas::Align, Gui},
     println,
 };
 use flipperzero_rt::{entry, manifest};
@@ -52,6 +53,7 @@ const NTAG_BLOCK_FILTER_STATUS: u8 = 0x08;
 const SCAN_TIMEOUT_MS: u32 = 30_000;
 const WRITE_TIMEOUT_MS: u32 = 10_000;
 const POLL_INTERVAL_MS: u32 = 100;
+const MIN_SCAN_TIME_MS: u32 = 500; // Minimum time before checking scan completion
 
 // UI Strings
 const STR_TITLE: &CStr = c"Xiaomi Filter Reset";
@@ -70,6 +72,14 @@ const STR_AUTH_FAILED: &CStr = c"Auth failed";
 const STR_WRITE_FAILED: &CStr = c"Write failed";
 const STR_NFC_ERROR: &CStr = c"NFC error";
 const STR_SCANNING: &CStr = c"Scanning...";
+
+// Screen dimensions for centering text
+const SCREEN_WIDTH: i32 = 128;
+const SCREEN_HEIGHT: i32 = 64;
+
+/// Global flag for scan abort - set by input callback, read by main loop
+/// This is necessary because the input callback runs on the GUI thread
+static SCAN_ABORT_FLAG: AtomicBool = AtomicBool::new(false);
 
 // =============================================================================
 // Types
@@ -177,6 +187,13 @@ fn format_hex_bytes(bytes: &[u8], buf: &mut [u8], separator: Option<u8>) -> usiz
 // =============================================================================
 
 /// ISO14443-3A poller callback for scanning (getting UID)
+///
+/// This callback is invoked by the NFC poller when events occur.
+/// - `Ready` event: A tag is in range, try to activate and read UID
+/// - `Error` event: Communication error (no tag in range) - CONTINUE polling
+/// - Other events: Continue polling
+///
+/// We only stop polling when we successfully read a UID.
 unsafe extern "C" fn iso14443_3a_scan_callback(
     event: sys::NfcGenericEvent,
     context: *mut core::ffi::c_void,
@@ -195,6 +212,7 @@ unsafe extern "C" fn iso14443_3a_scan_callback(
             // Allocate and activate to get UID
             let iso_data = unsafe { sys::iso14443_3a_alloc() };
             if iso_data.is_null() {
+                // Memory allocation failed - this is a real error, stop polling
                 ctx.error = true;
                 return sys::NfcCommandStop;
             }
@@ -202,21 +220,26 @@ unsafe extern "C" fn iso14443_3a_scan_callback(
             let result = unsafe { sys::iso14443_3a_poller_activate(instance, iso_data) };
 
             if result == sys::Iso14443_3aErrorNone {
+                // Successfully activated tag and got UID
                 let data = unsafe { &*iso_data };
                 let uid_len = (data.uid_len as usize).min(7);
                 ctx.uid[..uid_len].copy_from_slice(&data.uid[..uid_len]);
                 ctx.uid_len = uid_len;
                 ctx.got_uid = true;
+                ctx.error = false;
+                unsafe { sys::iso14443_3a_free(iso_data) };
+                // Stop polling - we have what we need
+                sys::NfcCommandStop
             } else {
-                ctx.error = true;
+                // Activation failed (tag moved away, etc.) - continue polling
+                unsafe { sys::iso14443_3a_free(iso_data) };
+                sys::NfcCommandContinue
             }
-
-            unsafe { sys::iso14443_3a_free(iso_data) };
-            sys::NfcCommandStop
         }
         sys::Iso14443_3aPollerEventTypeError => {
-            ctx.error = true;
-            sys::NfcCommandStop
+            // Error event typically means no tag in range - continue polling
+            // Don't set ctx.error here, as this is normal "no tag" behavior
+            sys::NfcCommandContinue
         }
         _ => sys::NfcCommandContinue,
     }
@@ -313,6 +336,59 @@ unsafe extern "C" fn iso14443_3a_write_callback(
 }
 
 // =============================================================================
+// ViewPort Callbacks
+// =============================================================================
+
+/// ViewPort draw callback for scanning screen
+/// Draws "Scanning..." centered horizontally and vertically
+/// SAFETY: Called from GUI thread with valid canvas pointer
+unsafe extern "C" fn scanning_draw_callback(
+    canvas: *mut sys::Canvas,
+    _context: *mut core::ffi::c_void,
+) {
+    // SAFETY: canvas pointer is guaranteed valid by GUI system
+    unsafe {
+        // Clear canvas
+        sys::canvas_clear(canvas);
+
+        // Get string width for centering (approximate: 6 pixels per character)
+        // "Scanning..." is 11 characters, roughly 66 pixels wide with default font
+        let text_width = 66;
+        let x = (SCREEN_WIDTH - text_width) / 2;
+        let y = SCREEN_HEIGHT / 2;
+
+        // Draw centered text
+        sys::canvas_draw_str(canvas, x, y, STR_SCANNING.as_ptr());
+    }
+}
+
+/// ViewPort input callback for scanning screen
+/// Handles Back and Left buttons to abort scanning
+/// SAFETY: Called from GUI thread with valid event pointer
+unsafe extern "C" fn scanning_input_callback(
+    event: *mut sys::InputEvent,
+    _context: *mut core::ffi::c_void,
+) {
+    if event.is_null() {
+        return;
+    }
+
+    // SAFETY: event pointer is guaranteed valid by GUI system after null check
+    let event = unsafe { &*event };
+
+    // Only respond to short press events
+    if event.type_ != sys::InputTypeShort {
+        return;
+    }
+
+    // Check for Back or Left key
+    if event.key == sys::InputKeyBack || event.key == sys::InputKeyLeft {
+        // Set abort flag - main loop will check this
+        SCAN_ABORT_FLAG.store(true, Ordering::SeqCst);
+    }
+}
+
+// =============================================================================
 // Application
 // =============================================================================
 
@@ -326,6 +402,8 @@ struct App {
     scan_ctx: Option<ScanContext>,
     scan_poller: Option<*mut sys::NfcPoller>,
     scan_elapsed_ms: u32,
+    gui: Gui,
+    scan_viewport: Option<*mut sys::ViewPort>,
 }
 
 impl App {
@@ -342,6 +420,8 @@ impl App {
                 return None;
             }
 
+            let gui = Gui::open();
+
             Some(Self {
                 state: AppState::StartPrompt,
                 tag_data: TagData::new(),
@@ -351,12 +431,16 @@ impl App {
                 scan_ctx: None,
                 scan_poller: None,
                 scan_elapsed_ms: 0,
+                gui,
+                scan_viewport: None,
             })
         }
     }
 
     /// Clean up all allocated resources
     fn cleanup(&mut self) {
+        self.hide_scanning_display();
+
         if let Some(poller) = self.scan_poller.take() {
             unsafe {
                 sys::nfc_poller_stop(poller);
@@ -388,8 +472,8 @@ impl App {
                     _ => {}
                 },
                 AppState::ScanDialog => {
-                    // Show dialog and start async scan
-                    self.show_scanning_dialog();
+                    // Show scanning display and start async scan
+                    self.show_scanning_display();
                     self.start_async_scan();
                     self.state = AppState::ScanRunning;
                 }
@@ -398,13 +482,19 @@ impl App {
                     unsafe { sys::furi_delay_ms(POLL_INTERVAL_MS) };
                     self.scan_elapsed_ms += POLL_INTERVAL_MS;
 
-                    if self.scan_elapsed_ms >= SCAN_TIMEOUT_MS {
+                    // Check for user abort first (always responsive)
+                    if self.is_scan_aborted() {
+                        self.stop_scan();
+                        self.hide_scanning_display();
+                        self.state = AppState::StartPrompt;
+                    } else if self.scan_elapsed_ms >= SCAN_TIMEOUT_MS {
+                        // Timeout reached - stop scanning
                         self.stop_scan();
                         self.fail_with(STR_SCAN_TIMEOUT);
-                    } else {
-                        if self.is_scan_complete() {
-                            self.finalize_scan();
-                        }
+                    } else if self.scan_elapsed_ms >= MIN_SCAN_TIME_MS && self.is_scan_complete() {
+                        // Only check completion after minimum scan time has passed
+                        // This prevents race conditions with early callback events
+                        self.finalize_scan();
                     }
                 }
                 AppState::TagInfo => match self.show_tag_info() {
@@ -461,16 +551,59 @@ impl App {
         dialogs.show_message(&message)
     }
 
-    /// Show scanning dialog (non-blocking, just displays text)
-    fn show_scanning_dialog(&self) {
-        let mut dialogs = DialogsApp::open();
-        let mut message = DialogMessage::new();
+    /// Show scanning display using ViewPort (non-blocking, persistent)
+    fn show_scanning_display(&mut self) {
+        // Don't create duplicate viewport
+        if self.scan_viewport.is_some() {
+            return;
+        }
 
-        message.set_header(STR_TITLE, 5, 8, Align::Left, Align::Top);
-        message.set_text(STR_SCANNING, 5, 25, Align::Left, Align::Top);
-        message.set_buttons(None, None, None);
+        // Clear abort flag before starting
+        SCAN_ABORT_FLAG.store(false, Ordering::SeqCst);
 
-        dialogs.show_message(&message);
+        unsafe {
+            // Allocate viewport
+            let viewport = sys::view_port_alloc();
+
+            // Set draw callback
+            sys::view_port_draw_callback_set(
+                viewport,
+                Some(scanning_draw_callback),
+                core::ptr::null_mut(),
+            );
+
+            // Set input callback for abort handling
+            sys::view_port_input_callback_set(
+                viewport,
+                Some(scanning_input_callback),
+                core::ptr::null_mut(),
+            );
+
+            // Add to GUI on fullscreen layer
+            sys::gui_add_view_port(self.gui.as_ptr(), viewport, sys::GuiLayerFullscreen);
+
+            // Enable viewport
+            sys::view_port_enabled_set(viewport, true);
+
+            // Store reference
+            self.scan_viewport = Some(viewport);
+        }
+    }
+
+    /// Hide scanning display by removing ViewPort
+    fn hide_scanning_display(&mut self) {
+        if let Some(viewport) = self.scan_viewport.take() {
+            unsafe {
+                // Disable viewport
+                sys::view_port_enabled_set(viewport, false);
+
+                // Remove from GUI
+                sys::gui_remove_view_port(self.gui.as_ptr(), viewport);
+
+                // Free viewport
+                sys::view_port_free(viewport);
+            }
+        }
     }
 
     /// Show tag info dialog and return button pressed
@@ -579,14 +712,20 @@ impl App {
     /// Check if scan is complete (success or error)
     fn is_scan_complete(&self) -> bool {
         match &self.scan_ctx {
-            Some(ctx) => ctx.got_uid || ctx.error || false,
+            Some(ctx) => ctx.got_uid || ctx.error,
             None => false,
         }
+    }
+
+    /// Check if user requested scan abort via back/left button
+    fn is_scan_aborted(&self) -> bool {
+        SCAN_ABORT_FLAG.load(Ordering::SeqCst)
     }
 
     /// Finalize scan operation and handle results
     fn finalize_scan(&mut self) {
         self.stop_scan();
+        self.hide_scanning_display();
 
         if let Some(ctx) = self.scan_ctx.take() {
             if ctx.error {
@@ -666,6 +805,7 @@ impl App {
 
     /// Transition to failure state with given message
     fn fail_with(&mut self, msg: &'static CStr) {
+        self.hide_scanning_display();
         self.error_msg = msg;
         self.state = AppState::Failure;
     }

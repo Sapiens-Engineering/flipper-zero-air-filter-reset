@@ -666,7 +666,6 @@ impl App {
                             // Retry - go back to scanning dialog
                             self.state = AppState::ScanDialog;
                         }
-                        _ => {}
                     }
                 }
             }
@@ -751,7 +750,7 @@ impl App {
         let mut message = DialogMessage::new();
 
         message.set_header(STR_TAG_FOUND, 5, 8, Align::Left, Align::Top);
-        message.set_text(&info_text, 5, 22, Align::Left, Align::Top);
+        message.set_text(info_text, 5, 22, Align::Left, Align::Top);
         message.set_buttons(Some(STR_ABORT), None, Some(STR_WRITE));
 
         dialogs.show_message(&message)
@@ -764,7 +763,7 @@ impl App {
         let mut message = DialogMessage::new();
 
         message.set_header(STR_SUCCESS, 5, 8, Align::Left, Align::Top);
-        message.set_text(&success_text, 5, 22, Align::Left, Align::Top);
+        message.set_text(success_text, 5, 22, Align::Left, Align::Top);
         message.set_buttons(None, Some(STR_OK), None);
 
         dialogs.show_message(&message)
@@ -894,7 +893,7 @@ impl App {
         let mut message = DialogMessage::new();
 
         message.set_header(STR_DEBUG_WRITE, 5, 8, Align::Left, Align::Top);
-        message.set_text(&debug_text, 5, 22, Align::Left, Align::Top);
+        message.set_text(debug_text, 5, 22, Align::Left, Align::Top);
         message.set_buttons(Some(STR_ABORT), None, Some(STR_GO));
 
         dialogs.show_message(&message)

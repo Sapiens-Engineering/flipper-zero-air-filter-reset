@@ -60,10 +60,9 @@ jobs:
       - name: Mirror - Push to GitHub
         env:
           GITHUB_PAT: ${{ secrets.MIRROR_GITHUB_PAT }}
-          GITHUB_REPO: ${{ secrets.GITHUB_REPO_URL }}
         run: |
           git config --global user.email "mail@sapiens.engineering"
           git config --global user.name "Sapient Engineer"
-          git remote add gh "https://x-access-token:$GITHUB_PAT@github.com/$GITHUB_REPO.git"
+          git remote add gh "https://x-access-token:$GITHUB_PAT@https://github.com/Sapiens-Engineering/flipper-zero-air-filter-reset.git"
           git fetch origin
           git push gh HEAD:master --force

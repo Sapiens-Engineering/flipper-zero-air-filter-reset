@@ -63,6 +63,6 @@ jobs:
         run: |
           git config --global user.email "mail@sapiens.engineering"
           git config --global user.name "Sapient Engineer"
-          git remote add gh "https://x-access-token:$GITHUB_PAT@https://github.com/Sapiens-Engineering/flipper-zero-air-filter-reset.git"
+          git remote add gh "https://x-access-token:$GITHUB_PAT@github.com/Sapiens-Engineering/flipper-zero-air-filter-reset.git"
           git fetch origin
           git push gh HEAD:master --force

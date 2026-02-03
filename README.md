@@ -2,7 +2,7 @@
 
 A Flipper Zero application to reset Xiaomi air purifier filter counters by writing zeros to the NFC tag's Block 8.
 
-Xiaomi air purifiers use NTAG NFC tags embedded in their filters to track usage. When the filter counter reaches a threshold, the purifier prompts for replacement—even if the filter still has life left. This app bypasses that limitation by resetting the counter to zero.
+Xiaomi air purifiers use NTAG NFC tags embedded in their filters to track usage. When the filter counter reaches a threshold, the purifier keeps prompting for replacement—even if the filter still has life left. This app bypasses that limitation by resetting the counter to zero.
 
 ## Features
 
@@ -134,9 +134,6 @@ This project would not be possible without the research and reverse engineering 
 
 - **unethical.info** — Original research and password algorithm discovery  
   https://unethical.info/2024/01/24/hacking-my-air-purifier/
-
-- **Hackaday** — Coverage and additional details  
-  https://hackaday.com/2024/01/26/hacking-a-xiaomi-air-purifiers-filter-drm-to-extend-its-lifespan/
 
 - **Milan Gajic** — Online password calculator tool  
   https://milan.gajic.eu/tinkering/tools/xiaomi-filter-reset

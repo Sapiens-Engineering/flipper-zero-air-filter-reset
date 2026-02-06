@@ -16,31 +16,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2025-08-31
           components: rustfmt
       - name: Check formatting
-        run: cargo +nightly fmt -- --check
+        run: cargo fmt -- --check
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2025-08-31
           components: clippy
           targets: thumbv7em-none-eabihf
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo +nightly clippy -- --deny warnings
+        run: cargo clippy -- --deny warnings
 
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-31
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run security audit
@@ -51,8 +55,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install target
-        run: rustup target add thumbv7em-none-eabihf
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-08-31
+          targets: thumbv7em-none-eabihf
       - name: Build
         run: cargo build --release
         env:

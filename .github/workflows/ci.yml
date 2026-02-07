@@ -91,11 +91,29 @@ jobs:
         run: cargo build --release
         env:
           CARGO_INCREMENTAL: 0
+      - name: Debug tag info
+        run: |
+          echo "=== Git version ==="
+          git --version
+          echo "=== Ref info ==="
+          echo "github.ref: ${{ github.ref }}"
+          echo "github.ref_name: ${{ github.ref_name }}"
+          echo "=== List all tags ==="
+          git tag -l
+          echo "=== Show refs ==="
+          git show-ref --tags || true
+          echo "=== Try git tag -l ==="
+          git tag -l --format='%(contents)' ${{ github.ref_name }} || true
+          echo "=== Try for-each-ref ==="
+          git for-each-ref --format='%(contents)' ${{ github.ref }} || true
+          echo "=== Try cat-file on ref ==="
+          git cat-file -t ${{ github.ref }} || true
+          git cat-file -p ${{ github.ref }} || true
       - name: Extract tag message
         id: tag_message
         run: |
-          git fetch origin ${{ github.ref }} --no-tags
-          TAG_MESSAGE=$(git tag -l --format='%(contents)' ${{ github.ref_name }})
+          git fetch --tags --force
+          TAG_MESSAGE=$(git for-each-ref --format='%(contents)' ${{ github.ref }})
           echo "message<<EOF" >> $GITHUB_OUTPUT
           echo "$TAG_MESSAGE" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT

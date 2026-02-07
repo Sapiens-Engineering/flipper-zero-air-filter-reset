@@ -155,6 +155,16 @@ bc1qpvu2sywgh5cgcn3raq6vswtxhkpljlrx906pgd
 
 Thank you for your support!
 
+## ⚠️ Disclaimer
+
+**NO AFFILIATION:** This project is an independent, open-source effort with **no affiliation, endorsement, or association** with Xiaomi Corporation or any of its subsidiaries.
+
+**EDUCATIONAL PURPOSE ONLY:** This software is provided strictly for educational, research, and interoperability purposes. It demonstrates reverse engineering of authentication protocols and NFC communication for academic study.
+
+**NO WARRANTY & USER RESPONSIBILITY:** This software is provided "AS IS" without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, or non-infringement. By using this software, you acknowledge that you use it entirely at your own risk and are solely responsible for compliance with all applicable laws. The authors assume no liability for any damages, losses, hardware damage, data loss, or legal consequences arising from use of this software.
+
+**WARRANTY VOID WARNING:** Modifying your air purifier's filter counters may void the manufacturer's warranty. Consult your warranty terms before proceeding.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

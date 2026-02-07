@@ -94,6 +94,7 @@ jobs:
       - name: Extract tag message
         id: tag_message
         run: |
+          git fetch origin ${{ github.ref }} --no-tags
           TAG_MESSAGE=$(git tag -l --format='%(contents)' ${{ github.ref_name }})
           echo "message<<EOF" >> $GITHUB_OUTPUT
           echo "$TAG_MESSAGE" >> $GITHUB_OUTPUT
